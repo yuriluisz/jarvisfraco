@@ -96,11 +96,12 @@ HALLUCINATIONS = [
     "legendas pela comunidade amara.org",
     "subtitles by",
     "sous-titres",
-    "amara.org"
+    "amara.org",
+    "you"
 ]
 
 def transcribe_audio_groq(audio_bytes):
-    """Transcreve o áudio gravado utilizando a API Whisper na Groq Cloud."""
+    """Transcreve o áudio gravado utilizando a API Whisper na Groq Cloud SEM prompt para evitar alucinações."""
     if not GROQ_KEY:
         print("[GROQ ERROR] GROQ_KEY não configurada no .env")
         return ""
@@ -108,11 +109,11 @@ def transcribe_audio_groq(audio_bytes):
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}"}
     files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
+    # SEM parâmetro 'prompt' para o Whisper jamais alucinar palavras de ativação
     data = {
         "model": "whisper-large-v3",
         "language": "pt",
-        "temperature": "0.0",
-        "prompt": "Jarvis, JARVIS, assistente Jarvis, computador."
+        "temperature": "0.0"
     }
 
     try:
@@ -120,8 +121,7 @@ def transcribe_audio_groq(audio_bytes):
         if resp.status_code == 200:
             txt = resp.json().get("text", "").strip()
             clean_check = txt.lower().strip(".,!?:; ")
-            # Filtro contra alucinações clássicas de silêncio do Whisper
-            if clean_check in HALLUCINATIONS or (any(h in clean_check for h in HALLUCINATIONS) and len(clean_check.split()) <= 4):
+            if clean_check in HALLUCINATIONS or (any(h in clean_check for h in HALLUCINATIONS) and len(clean_check.split()) <= 3):
                 print(f"[GROQ] Descartando alucinação de silêncio: \"{txt}\"")
                 return ""
             return txt
@@ -158,10 +158,8 @@ def create_wav_bytes(frames):
     wav_io.seek(0)
     return wav_io.read()
 
-WAKE_ALIASES = [
-    "jarvis", "jarves", "jardins", "jardim", "jarbas", "jarv", "darvis", "larvis", "iarvis", 
-    "já é", "ja e", "computador"
-]
+# Apelidos fonéticos precisos (apenas o essencial)
+WAKE_ALIASES = ["jarvis", "jardins", "jardim", "jarbas", "computador"]
 
 def flush_audio(stream, ring_buffer):
     """Purga instantaneamente qualquer buffer antigo acumulado no hardware."""
@@ -172,14 +170,32 @@ def flush_audio(stream, ring_buffer):
     except Exception:
         pass
 
+def speak_and_flush(text, stream, ring_buffer):
+    """Fala pela caixinha e pausa o microfone para que o Jarvis NUNCA ouça a própria voz."""
+    if not text or not text.strip():
+        return
+    try:
+        stream.stop()
+    except Exception:
+        pass
+
+    speak(text)
+    time.sleep(0.4)
+
+    ring_buffer.clear()
+    try:
+        stream.start()
+    except Exception:
+        pass
+
 def main():
     print("==================================================")
-    print("🎙️ JARVIS VOICE ASSISTANT - CONTÍNUO & OTIMIZADO")
+    print("🎙️ JARVIS VOICE ASSISTANT - CONTÍNUO & BLINDADO")
     print("==================================================")
 
     configured_wake = [w.strip().lower() for w in get_config("wake_words", "jarvis,computador").split(",")]
     wake_words = list(set(configured_wake + WAKE_ALIASES))
-    print(f"[SYSTEM] Palavras e variações de ativação: {wake_words}")
+    print(f"[SYSTEM] Palavras de ativação: {wake_words}")
 
     PRE_ROLL_SECONDS = 0.8
     SILENCE_TIMEOUT = 1.0
@@ -205,10 +221,10 @@ def main():
             calib_samples.append(np.sqrt(np.mean(data.astype(float)**2)))
 
         noise_floor = int(np.mean(calib_samples)) if calib_samples else 50
-        configured_floor = int(get_config("mic_threshold", "480") or 480)
-        # Limiar mínimo de 480 RMS para ignorar cliques de teclado e ruído ambiente
-        threshold = max(configured_floor, int(noise_floor * 3.5), 480)
-        print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Ativo Anti-Ruído: {threshold} RMS")
+        configured_floor = int(get_config("mic_threshold", "550") or 550)
+        # Limiar firme de 550 RMS para imunidade total contra cliques de teclado e ventilador
+        threshold = max(configured_floor, int(noise_floor * 3.5), 550)
+        print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Blindado: {threshold} RMS")
         flush_audio(stream, ring_buffer)
 
         while True:
@@ -241,9 +257,9 @@ def main():
                     duration_sec = len(recorded_frames) * (CHUNK / RATE)
                     print(f"[VAD] Gravação concluída: {duration_sec:.2f}s ({len(recorded_frames)} blocos).")
 
-                    # Ignora barulhinhos/cliques ultracurtos (< 0.3s)
-                    if len(recorded_frames) < int((RATE / CHUNK) * 0.3):
-                        print("[VAD] Descartado por ser muito curto (ruído transitório).")
+                    # Ignora barulhinhos/cliques ultracurtos (< 0.4s)
+                    if len(recorded_frames) < int((RATE / CHUNK) * 0.4):
+                        print("[VAD] Descartado por ser muito curto.")
                         flush_audio(stream, ring_buffer)
                         continue
 
@@ -272,17 +288,15 @@ def main():
                     duck_volume(low=True)
 
                     clean_query = clean_norm
-                    # Ordena do maior para o menor para 'jarvis' ser substituído antes de 'jarve'
                     for w in sorted(wake_words, key=len, reverse=True):
                         clean_query = clean_query.replace(w, "")
                     clean_query = clean_query.strip(" ,.?!")
 
-                    # 1. Se chamou apenas o nome sem comando (ou se sobrou só ruído/fragmento de 1 a 3 letras)
+                    # 1. Se chamou apenas o nome sem comando
                     if not clean_query or len(clean_query) <= 3:
                         resp = "Sim, senhor. Às suas ordens."
                         print(f"[RESPOSTA] {resp}")
-                        speak(resp)
-                        flush_audio(stream, ring_buffer)
+                        speak_and_flush(resp, stream, ring_buffer)
                         log_interaction(text, "WAKE_ONLY", resp, int((time.time() - start_time) * 1000))
                         duck_volume(low=False)
                         continue
@@ -293,8 +307,7 @@ def main():
                         print("[CMD] Interrompendo áudio/música imediatamente.")
                         stop_music()
                         resp = "Música pausada."
-                        speak(resp)
-                        flush_audio(stream, ring_buffer)
+                        speak_and_flush(resp, stream, ring_buffer)
                         log_interaction(text, "STOP_MUSIC", resp, int((time.time() - start_time) * 1000))
                         continue
 
@@ -302,8 +315,7 @@ def main():
                     if any(h in clean_query for h in ["que horas são", "que hora é", "hora atual", "horas agora"]):
                         current_time = time.strftime("%H e %M")
                         resp = f"Agora são {current_time}."
-                        speak(resp)
-                        flush_audio(stream, ring_buffer)
+                        speak_and_flush(resp, stream, ring_buffer)
                         log_interaction(text, "TIME_QUERY", resp, int((time.time() - start_time) * 1000))
                         duck_volume(low=False)
                         continue
@@ -322,19 +334,17 @@ def main():
                     if is_music and music_query and len(music_query) <= 60 and "desculpe" not in music_query:
                         resp = f"Tocando {music_query} agora."
                         print(f"[MÚSICA] {resp}")
-                        speak(resp)
-                        flush_audio(stream, ring_buffer)
+                        speak_and_flush(resp, stream, ring_buffer)
                         play_music_youtube(music_query)
                         log_interaction(text, "PLAY_MUSIC", resp, int((time.time() - start_time) * 1000))
                         continue
 
                     # 5. Raciocínio com IA (Gemini Flash)
-                    if len(clean_query) > 1 and "desculpe" not in clean_query:
+                    if len(clean_query) > 3 and "desculpe" not in clean_query:
                         print(f"[IA] Raciocinando com memória contextual: \"{clean_query}\"...")
                         resp = ask_jarvis_ai(clean_query)
                         print(f"[RESPOSTA] {resp}")
-                        speak(resp)
-                        flush_audio(stream, ring_buffer)
+                        speak_and_flush(resp, stream, ring_buffer)
                         log_interaction(text, "CHAT_AI", resp, int((time.time() - start_time) * 1000))
                         duck_volume(low=False)
                         continue
