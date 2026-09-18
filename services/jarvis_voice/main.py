@@ -272,12 +272,13 @@ def main():
                     duck_volume(low=True)
 
                     clean_query = clean_norm
-                    for w in wake_words:
+                    # Ordena do maior para o menor para 'jarvis' ser substituído antes de 'jarve'
+                    for w in sorted(wake_words, key=len, reverse=True):
                         clean_query = clean_query.replace(w, "")
                     clean_query = clean_query.strip(" ,.?!")
 
-                    # 1. Se chamou apenas o nome sem comando
-                    if not clean_query:
+                    # 1. Se chamou apenas o nome sem comando (ou se sobrou só ruído/fragmento de 1 a 3 letras)
+                    if not clean_query or len(clean_query) <= 3:
                         resp = "Sim, senhor. Às suas ordens."
                         print(f"[RESPOSTA] {resp}")
                         speak(resp)
