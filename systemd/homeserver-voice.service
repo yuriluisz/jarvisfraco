@@ -1,0 +1,19 @@
+[Unit]
+Description=Jarvis Voice Assistant (Microfone, Groq e Som)
+After=sound.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__WORKING_DIR__
+Environment="PYTHONUNBUFFERED=1"
+Environment="XDG_RUNTIME_DIR=/run/user/__UID__"
+Environment="PULSE_SERVER=unix:/run/user/__UID__/pulse/native"
+Environment="PIPEWIRE_RUNTIME_DIR=/run/user/__UID__"
+ExecStart=__WORKING_DIR__/venv/bin/python services/jarvis_voice/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

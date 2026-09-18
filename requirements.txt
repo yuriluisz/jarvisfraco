@@ -1,0 +1,19 @@
+# Core e Comunicação
+requests>=2.31.0
+pydantic>=2.5.0
+
+# Áudio, Voz e Processamento
+sounddevice>=0.4.6
+numpy>=1.24.0
+edge-tts>=6.1.10
+yt-dlp>=2024.1.0
+
+# Visão Computacional (Sentinela)
+opencv-python-headless>=4.8.0
+
+# Armazenamento e Monitoramento de Arquivos
+watchdog>=3.0.0
+
+# Micro-API e Servidor Web do Dashboard
+fastapi>=0.109.0
+uvicorn>=0.27.0

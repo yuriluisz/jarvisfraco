@@ -1,0 +1,15 @@
+[Unit]
+Description=Jarvis Control API & Web Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__WORKING_DIR__
+ExecStart=__WORKING_DIR__/venv/bin/python services/api/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

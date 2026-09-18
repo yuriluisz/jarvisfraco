@@ -1,0 +1,47 @@
+# Configurações de ambiente e segredos
+.env
+*.env
+*.env.local
+
+# Banco de dados e armazenamento local
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+storage/inbox/*
+storage/organizados/*
+!storage/inbox/.gitkeep
+!storage/organizados/.gitkeep
+
+# Ambientes virtuais e dependências
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Caches do Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Arquivos temporários e mídia gerada
+/tmp/*
+*.jpg
+*.jpeg
+*.png
+*.mp3
+*.wav
+*.m4a
+*.log
+
+# IDEs e Sistema Operacional
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

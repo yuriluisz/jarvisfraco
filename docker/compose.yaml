@@ -1,0 +1,28 @@
+services:
+  # Gestor web de stacks e containers ultra-leve
+  dockge:
+    image: louislam/dockge:1
+    container_name: dockge
+    restart: unless-stopped
+    ports:
+      - 5001:5001
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/dockge:/app/data
+      - ./compose.yaml:/opt/stacks/homeserver/compose.yaml
+    environment:
+      - DOCKGE_STACKS_DIR=/opt/stacks
+
+  # Servidor de streaming local (Direct Play configurado para zero consumo de CPU)
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    ports:
+      - 8096:8096
+    volumes:
+      - ./data/jellyfin/config:/config
+      - ./data/jellyfin/cache:/cache
+      - ../storage/organizados/Midia:/media:ro
+    environment:
+      - TZ=America/Sao_Paulo
