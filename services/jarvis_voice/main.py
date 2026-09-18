@@ -110,7 +110,7 @@ def transcribe_audio_groq(audio_bytes):
         "model": "whisper-large-v3",
         "language": "pt",
         "temperature": "0.0",
-        "prompt": "Jarvis, computador, assistente de voz, tocar música, que horas são."
+        "prompt": "Jarvis, JARVIS, assistente Jarvis. Nome próprio: Jarvis. Computador, tocar música, que horas são."
     }
 
     try:
@@ -156,7 +156,7 @@ def create_wav_bytes(frames):
     return wav_io.read()
 
 WAKE_ALIASES = [
-    "jarvis", "jarves", "jardins", "jarbas", "jarv", "darvis", "larvis", "iarvis", 
+    "jarvis", "jarves", "jardins", "jardim", "jarbas", "jarv", "darvis", "larvis", "iarvis", 
     "já é", "ja e", "computador"
 ]
 
@@ -234,6 +234,11 @@ def main():
 
                     print("[GROQ] Enviando áudio para transcrição Whisper...")
                     audio_bytes = create_wav_bytes(recorded_frames)
+                    try:
+                        with open("/tmp/last_recorded.wav", "wb") as f:
+                            f.write(audio_bytes)
+                    except Exception:
+                        pass
                     text = transcribe_audio_groq(audio_bytes)
 
                     if not text:
