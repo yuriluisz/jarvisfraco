@@ -86,6 +86,17 @@ def log_interaction(transcription, intent, response, latency_ms):
     except Exception as e:
         print(f"[DB LOG ERROR] Falha ao salvar no banco: {e}")
 
+HALLUCINATIONS = [
+    "obrigado por assistir",
+    "obrigada por assistir",
+    "obrigado por assistir!",
+    "obrigada por assistir!",
+    "deixe seu like",
+    "inscreva-se no canal",
+    "legendas pela comunidade amara.org",
+    "subtitles by",
+]
+
 def transcribe_audio_groq(audio_bytes):
     """Transcreve o áudio gravado utilizando a API Whisper na Groq Cloud."""
     if not GROQ_KEY:
@@ -95,12 +106,22 @@ def transcribe_audio_groq(audio_bytes):
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}"}
     files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
-    data = {"model": "whisper-large-v3", "language": "pt"}
+    data = {
+        "model": "whisper-large-v3",
+        "language": "pt",
+        "temperature": "0.0",
+        "prompt": "Jarvis, computador, assistente de voz, tocar música, que horas são."
+    }
 
     try:
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=10)
         if resp.status_code == 200:
-            return resp.json().get("text", "").strip()
+            txt = resp.json().get("text", "").strip()
+            # Filtro contra alucinações clássicas de silêncio do Whisper
+            if any(h in txt.lower() for h in HALLUCINATIONS) and len(txt.split()) <= 4:
+                print(f"[GROQ] Descartando alucinação comum do Whisper: \"{txt}\"")
+                return ""
+            return txt
         else:
             print(f"[GROQ HTTP ERROR] {resp.status_code}: {resp.text}")
     except Exception as e:
@@ -134,15 +155,21 @@ def create_wav_bytes(frames):
     wav_io.seek(0)
     return wav_io.read()
 
+WAKE_ALIASES = [
+    "jarvis", "jarves", "jardins", "jarbas", "jarv", "darvis", "larvis", "iarvis", 
+    "já é", "ja e", "computador"
+]
+
 def main():
     print("==================================================")
     print("🎙️ JARVIS VOICE ASSISTANT - CONTÍNUO & OTIMIZADO")
     print("==================================================")
 
-    wake_words = [w.strip().lower() for w in get_config("wake_words", "jarvis,computador").split(",")]
-    print(f"[SYSTEM] Palavras de ativação: {wake_words}")
+    configured_wake = [w.strip().lower() for w in get_config("wake_words", "jarvis,computador").split(",")]
+    wake_words = list(set(configured_wake + WAKE_ALIASES))
+    print(f"[SYSTEM] Palavras e variações de ativação: {wake_words}")
 
-    PRE_ROLL_SECONDS = 0.8
+    PRE_ROLL_SECONDS = 1.0
     SILENCE_TIMEOUT = 1.0
     MAX_RECORD_SECONDS = 8.0
 
@@ -167,7 +194,7 @@ def main():
 
         noise_floor = int(np.mean(calib_samples)) if calib_samples else 20
         configured_floor = int(get_config("mic_threshold", "120") or 120)
-        threshold = max(configured_floor, int(noise_floor * 2.2))
+        threshold = max(configured_floor, int(noise_floor * 2.0))
         print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Ativo: {threshold} RMS")
 
         while True:
@@ -178,7 +205,7 @@ def main():
 
                 if rms > threshold:
                     start_time = time.time()
-                    print(f"\n[VAD] Fala detectada ({int(rms)} RMS). Ouvindo...")
+                    print(f"\n[VAD] Fala detectada (RMS: {int(rms)} > Limiar: {threshold}). Ouvindo fala...")
 
                     # Captura o áudio prévio para garantir que "Jarvis" não foi cortado
                     recorded_frames = list(ring_buffer)
@@ -197,33 +224,44 @@ def main():
                         if silent_chunks > silence_limit and len(recorded_frames) > silence_limit * 2:
                             break
 
-                    # Ignora barulhinhos/cliques ultracurtos (< 0.4s)
-                    if len(recorded_frames) < int((RATE / CHUNK) * 0.4):
+                    duration_sec = len(recorded_frames) * (CHUNK / RATE)
+                    print(f"[VAD] Gravação concluída: {duration_sec:.2f}s ({len(recorded_frames)} blocos).")
+
+                    # Ignora barulhinhos/cliques ultracurtos (< 0.3s)
+                    if len(recorded_frames) < int((RATE / CHUNK) * 0.3):
+                        print("[VAD] Descartado por ser muito curto (ruído transitório).")
                         continue
 
+                    print("[GROQ] Enviando áudio para transcrição Whisper...")
                     audio_bytes = create_wav_bytes(recorded_frames)
                     text = transcribe_audio_groq(audio_bytes)
 
                     if not text:
+                        print("[GROQ] Nenhum texto reconhecido no áudio.")
                         continue
 
                     text_lower = text.lower()
                     print(f"[OUVIU] \"{text}\"")
 
-                    is_wake = any(w in text_lower for w in wake_words)
+                    # Verificação flexível de palavra de ativação
+                    clean_norm = text_lower.replace(".", " ").replace(",", " ").replace("!", " ").replace("?", " ").strip()
+                    words_in_text = clean_norm.split()
+                    
+                    is_wake = any(w in text_lower for w in wake_words) or any(w in words_in_text for w in wake_words)
+                    print(f"[CHECK] Palavra de ativação detectada? {is_wake}")
                     if not is_wake:
                         continue
 
                     duck_volume(low=True)
 
-                    clean_query = text_lower
+                    clean_query = clean_norm
                     for w in wake_words:
                         clean_query = clean_query.replace(w, "")
-                    clean_query = clean_query.strip(",.?! ")
+                    clean_query = clean_query.strip(" ,.?!")
 
                     # Se disse apenas "Jarvis" sem comando imediato
                     if not clean_query:
-                        resp = "Sim, senhor. Como posso ajudar?"
+                        resp = "Sim, senhor. Às suas ordens."
                         print(f"[RESPOSTA] {resp}")
                         speak(resp)
                         log_interaction(text, "WAKE_ONLY", resp, int((time.time() - start_time) * 1000))
