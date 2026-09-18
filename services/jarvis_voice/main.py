@@ -3,6 +3,7 @@ import sys
 import io
 import time
 import wave
+import sqlite3
 import requests
 import subprocess
 import numpy as np
@@ -23,23 +24,71 @@ def load_env():
         with open(env_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:].strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip().strip("'").strip('"')
     return env
 
 ENV = load_env()
-GROQ_KEY = os.getenv("GROQ_KEY") or ENV.get("GROQ_KEY")
+GROQ_KEY = (
+    os.getenv("GROQ_KEY") 
+    or os.getenv("GROQ_API_KEY") 
+    or ENV.get("GROQ_KEY") 
+    or ENV.get("GROQ_API_KEY")
+)
 AGY_PATH = os.getenv("AGY_PATH") or ENV.get("AGY_PATH", "agy")
 
 RATE = 16000
 CHANNELS = 1
 CHUNK = 1024
 
+def get_conversation_history(limit=4):
+    """Recupera as últimas conversas do SQLite para dar memória contextual à IA."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT transcription, response_text 
+            FROM voice_interactions 
+            WHERE source='VOICE_ROOM' 
+            ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            return ""
+
+        history_lines = ["\n[Contexto das últimas conversas no quarto]:"]
+        for r in reversed(rows):
+            if r['transcription'] and r['response_text']:
+                history_lines.append(f"Usuário: {r['transcription']}")
+                history_lines.append(f"Jarvis: {r['response_text']}")
+        return "\n".join(history_lines) + "\n"
+    except Exception as e:
+        print(f"[HISTORY WARN] {e}")
+        return ""
+
+def log_interaction(transcription, intent, response, latency_ms):
+    """Salva permanentemente a conversa no SQLite para o Diário de Voz e memória contextual."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO voice_interactions (source, transcription, intent_detected, response_text, latency_ms, created_at)
+            VALUES ('VOICE_ROOM', ?, ?, ?, ?, datetime('now', 'localtime'))
+        """, (transcription, intent, response, latency_ms))
+        conn.commit()
+        conn.close()
+        print(f"[DB] Interação salva com sucesso no banco!")
+    except Exception as e:
+        print(f"[DB LOG ERROR] Falha ao salvar no banco: {e}")
+
 def transcribe_audio_groq(audio_bytes):
-    """Envia o áudio gravado para a API gratuita do Whisper na Groq Cloud."""
+    """Transcreve o áudio gravado utilizando a API Whisper na Groq Cloud."""
     if not GROQ_KEY:
-        print("[GROQ ERROR] Chave GROQ_KEY não configurada no .env")
+        print("[GROQ ERROR] GROQ_KEY não configurada no .env")
         return ""
 
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -58,9 +107,10 @@ def transcribe_audio_groq(audio_bytes):
     return ""
 
 def ask_jarvis_ai(prompt):
-    """Envia pergunta para o cérebro do Jarvis (Antigravity CLI / Gemini)."""
+    """Envia pergunta contextualizada com memória para o Gemini via Antigravity CLI."""
     sys_prompt = get_config("system_prompt", "Você é o Jarvis, um assistente inteligente e conciso. Responda de forma direta para fala em voz alta.")
-    full_prompt = f"{sys_prompt}\n\nUsuário: {prompt}\nJarvis:"
+    history = get_conversation_history(limit=4)
+    full_prompt = f"{sys_prompt}\n{history}\nUsuário atual: {prompt}\nJarvis:"
 
     try:
         cmd = [AGY_PATH, "-p", full_prompt, "--dangerously-skip-permissions"]
@@ -73,7 +123,7 @@ def ask_jarvis_ai(prompt):
     return "Desculpe, não consegui processar a resposta no momento."
 
 def record_speech_vad(threshold, max_seconds=10, silence_timeout=0.8):
-    """Grava o áudio do microfone a partir do limiar e para após silêncio."""
+    """Grava o áudio do microfone a partir do limiar e encerra após silêncio."""
     frames = []
     silent_chunks = 0
     silence_limit = int((RATE / CHUNK) * silence_timeout)
@@ -93,7 +143,6 @@ def record_speech_vad(threshold, max_seconds=10, silence_timeout=0.8):
             if silent_chunks > silence_limit and len(frames) > silence_limit * 2:
                 break
 
-    # Gera buffer WAV em memória
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wf:
         wf.setnchannels(CHANNELS)
@@ -104,50 +153,33 @@ def record_speech_vad(threshold, max_seconds=10, silence_timeout=0.8):
     return wav_io.read()
 
 def calibrate_noise():
-    """Calibra o ruído ambiente do quarto para ajustar o limiar."""
     print("[CALIBRATE] Calibrando ruído ambiente do microfone...")
     samples = []
     try:
         with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK) as stream:
-            for _ in range(int(RATE / CHUNK * 1.5)): # 1.5 segundos
+            for _ in range(int(RATE / CHUNK * 1.5)):
                 data, _ = stream.read(CHUNK)
-                rms = np.sqrt(np.mean(data.astype(float)**2))
-                samples.append(rms)
-        noise_floor = int(np.mean(samples)) if samples else 50
-        configured_floor = int(get_config("mic_threshold", 200))
+                samples.append(np.sqrt(np.mean(data.astype(float)**2)))
+        noise_floor = int(np.mean(samples)) if samples else 40
+        configured_floor = int(get_config("mic_threshold", "200") or 200)
         threshold = max(configured_floor, int(noise_floor * 2.2))
         print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Ativo: {threshold} RMS")
         return threshold
     except Exception as e:
-        print(f"[CALIBRATE WARN] Erro na calibração: {e}. Usando limiar padrão 200.")
+        print(f"[CALIBRATE WARN] {e}. Usando limiar padrão 200.")
         return 200
-
-def log_interaction(transcription, intent, response, latency_ms):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO voice_interactions (source, transcription, intent_detected, response_text, latency_ms, created_at)
-            VALUES ('VOICE_ROOM', ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, (transcription, intent, response, latency_ms))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[DB LOG ERROR] {e}")
 
 def main():
     print("==================================================")
-    print("🎙️ JARVIS VOICE ASSISTANT - OPERACIONAL")
+    print("🎙️ JARVIS VOICE ASSISTANT - COM MEMÓRIA ATIVA")
     print("==================================================")
 
     threshold = calibrate_noise()
     wake_words = [w.strip().lower() for w in get_config("wake_words", "jarvis,computador").split(",")]
-
-    print(f"[SYSTEM] Aguardando palavras de ativação: {wake_words}")
+    print(f"[SYSTEM] Palavras de ativação ativas: {wake_words}")
 
     while True:
         try:
-            # Escuta contínua com sounddevice
             with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK) as stream:
                 data, _ = stream.read(CHUNK)
                 rms = np.sqrt(np.mean(data.astype(float)**2))
@@ -155,7 +187,7 @@ def main():
             if rms > threshold:
                 duck_volume(low=True)
                 start_time = time.time()
-                print(f"\n[VAD] Fala detectada (RMS {int(rms)}). Gravando comando...")
+                print(f"\n[VAD] Fala detectada ({int(rms)} RMS). Gravando comando...")
 
                 audio_data = record_speech_vad(threshold)
                 text = transcribe_audio_groq(audio_data)
@@ -167,19 +199,16 @@ def main():
                 text_lower = text.lower()
                 print(f"[OUVIU] \"{text}\"")
 
-                # Verifica se contém a palavra de ativação
                 is_wake = any(w in text_lower for w in wake_words)
                 if not is_wake:
                     duck_volume(low=False)
                     continue
 
-                # Remove a palavra de ativação do comando
                 clean_query = text_lower
                 for w in wake_words:
                     clean_query = clean_query.replace(w, "")
                 clean_query = clean_query.strip(",.?! ")
 
-                # Roteamento de intenções
                 if any(m in clean_query for m in ["toca ", "toque ", "tocar ", "play "]):
                     music_query = clean_query.replace("toca", "").replace("toque", "").replace("tocar", "").replace("play", "").strip()
                     resp = f"Tocando {music_query} agora."
@@ -201,8 +230,7 @@ def main():
                     duck_volume(low=False)
 
                 else:
-                    # Pergunta geral para a IA
-                    print(f"[IA] Processando com Gemini: \"{clean_query}\"...")
+                    print(f"[IA] Raciocinando com memória contextual: \"{clean_query}\"...")
                     resp = ask_jarvis_ai(clean_query)
                     print(f"[RESPOSTA] {resp}")
                     speak(resp)
@@ -213,7 +241,7 @@ def main():
             print("\n[INFO] Assistente de voz finalizado.")
             break
         except Exception as e:
-            print(f"[VOICE LOOP ERROR] {e}")
+            print(f"[VOICE ERROR] {e}")
             time.sleep(1)
 
 if __name__ == "__main__":
