@@ -87,14 +87,16 @@ def log_interaction(transcription, intent, response, latency_ms):
         print(f"[DB LOG ERROR] Falha ao salvar no banco: {e}")
 
 HALLUCINATIONS = [
+    "obrigado",
+    "obrigada",
     "obrigado por assistir",
     "obrigada por assistir",
-    "obrigado por assistir!",
-    "obrigada por assistir!",
     "deixe seu like",
     "inscreva-se no canal",
     "legendas pela comunidade amara.org",
     "subtitles by",
+    "sous-titres",
+    "amara.org"
 ]
 
 def transcribe_audio_groq(audio_bytes):
@@ -117,9 +119,10 @@ def transcribe_audio_groq(audio_bytes):
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=10)
         if resp.status_code == 200:
             txt = resp.json().get("text", "").strip()
+            clean_check = txt.lower().strip(".,!?:; ")
             # Filtro contra alucinações clássicas de silêncio do Whisper
-            if any(h in txt.lower() for h in HALLUCINATIONS) and len(txt.split()) <= 4:
-                print(f"[GROQ] Descartando alucinação comum do Whisper: \"{txt}\"")
+            if clean_check in HALLUCINATIONS or (any(h in clean_check for h in HALLUCINATIONS) and len(clean_check.split()) <= 4):
+                print(f"[GROQ] Descartando alucinação de silêncio: \"{txt}\"")
                 return ""
             return txt
         else:
@@ -136,7 +139,7 @@ def ask_jarvis_ai(prompt):
 
     try:
         cmd = [AGY_PATH, "-p", full_prompt, "--dangerously-skip-permissions"]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
     except Exception as e:
@@ -161,12 +164,11 @@ WAKE_ALIASES = [
 ]
 
 def flush_audio(stream, ring_buffer):
-    """Descarta frames antigos acumulados no buffer do hardware enquanto o Jarvis falava ou processava."""
+    """Purga instantaneamente qualquer buffer antigo acumulado no hardware."""
     ring_buffer.clear()
     try:
-        avail = stream.read_available
-        if avail > 0:
-            stream.read(avail)
+        stream.stop()
+        stream.start()
     except Exception:
         pass
 
@@ -179,9 +181,9 @@ def main():
     wake_words = list(set(configured_wake + WAKE_ALIASES))
     print(f"[SYSTEM] Palavras e variações de ativação: {wake_words}")
 
-    PRE_ROLL_SECONDS = 1.0
+    PRE_ROLL_SECONDS = 0.8
     SILENCE_TIMEOUT = 1.0
-    MAX_RECORD_SECONDS = 8.0
+    MAX_RECORD_SECONDS = 7.0
 
     pre_roll_chunks = int((RATE / CHUNK) * PRE_ROLL_SECONDS)
     silence_limit = int((RATE / CHUNK) * SILENCE_TIMEOUT)
@@ -189,7 +191,7 @@ def main():
 
     ring_buffer = collections.deque(maxlen=pre_roll_chunks)
 
-    # Mantém o InputStream aberto continuamente (0% CPU, sem xruns)
+    # Mantém o InputStream aberto continuamente
     with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK) as stream:
         # Descartar primeiro 0.3s de transiente
         for _ in range(int(RATE / CHUNK * 0.3)):
@@ -202,10 +204,12 @@ def main():
             data, _ = stream.read(CHUNK)
             calib_samples.append(np.sqrt(np.mean(data.astype(float)**2)))
 
-        noise_floor = int(np.mean(calib_samples)) if calib_samples else 20
-        configured_floor = int(get_config("mic_threshold", "120") or 120)
-        threshold = max(configured_floor, int(noise_floor * 2.0))
-        print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Ativo: {threshold} RMS")
+        noise_floor = int(np.mean(calib_samples)) if calib_samples else 50
+        configured_floor = int(get_config("mic_threshold", "480") or 480)
+        # Limiar mínimo de 480 RMS para ignorar cliques de teclado e ruído ambiente
+        threshold = max(configured_floor, int(noise_floor * 3.5), 480)
+        print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Ativo Anti-Ruído: {threshold} RMS")
+        flush_audio(stream, ring_buffer)
 
         while True:
             try:
@@ -240,6 +244,7 @@ def main():
                     # Ignora barulhinhos/cliques ultracurtos (< 0.3s)
                     if len(recorded_frames) < int((RATE / CHUNK) * 0.3):
                         print("[VAD] Descartado por ser muito curto (ruído transitório).")
+                        flush_audio(stream, ring_buffer)
                         continue
 
                     print("[GROQ] Enviando áudio para transcrição Whisper...")
@@ -248,6 +253,7 @@ def main():
 
                     if not text:
                         print("[GROQ] Nenhum texto reconhecido no áudio.")
+                        flush_audio(stream, ring_buffer)
                         continue
 
                     text_lower = text.lower()
@@ -260,6 +266,7 @@ def main():
                     is_wake = any(w in text_lower for w in wake_words) or any(w in words_in_text for w in wake_words)
                     print(f"[CHECK] Palavra de ativação detectada? {is_wake}")
                     if not is_wake:
+                        flush_audio(stream, ring_buffer)
                         continue
 
                     duck_volume(low=True)
