@@ -32,12 +32,14 @@ def duck_volume(low=True):
     send_mpv_command(["set_property", "volume", vol])
 
 def stop_music():
-    """Encerra a reprodução do player de música mpv."""
+    """Encerra a reprodução do player de música mpv e yt-dlp."""
     try:
         if platform.system() == "Windows":
             subprocess.run("taskkill /F /IM mpv.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run("taskkill /F /IM yt-dlp.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.run("pkill -9 -f 'mpv'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run("pkill -9 -f 'yt-dlp'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(SOCKET_PATH):
                 try:
                     os.remove(SOCKET_PATH)

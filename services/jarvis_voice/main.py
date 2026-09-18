@@ -110,7 +110,7 @@ def transcribe_audio_groq(audio_bytes):
         "model": "whisper-large-v3",
         "language": "pt",
         "temperature": "0.0",
-        "prompt": "Jarvis, JARVIS, assistente Jarvis. Nome próprio: Jarvis. Computador, tocar música, que horas são."
+        "prompt": "Jarvis, JARVIS, assistente Jarvis, computador."
     }
 
     try:
@@ -159,6 +159,16 @@ WAKE_ALIASES = [
     "jarvis", "jarves", "jardins", "jardim", "jarbas", "jarv", "darvis", "larvis", "iarvis", 
     "já é", "ja e", "computador"
 ]
+
+def flush_audio(stream, ring_buffer):
+    """Descarta frames antigos acumulados no buffer do hardware enquanto o Jarvis falava ou processava."""
+    ring_buffer.clear()
+    try:
+        avail = stream.read_available
+        if avail > 0:
+            stream.read(avail)
+    except Exception:
+        pass
 
 def main():
     print("==================================================")
@@ -234,11 +244,6 @@ def main():
 
                     print("[GROQ] Enviando áudio para transcrição Whisper...")
                     audio_bytes = create_wav_bytes(recorded_frames)
-                    try:
-                        with open("/tmp/last_recorded.wav", "wb") as f:
-                            f.write(audio_bytes)
-                    except Exception:
-                        pass
                     text = transcribe_audio_groq(audio_bytes)
 
                     if not text:
@@ -264,46 +269,69 @@ def main():
                         clean_query = clean_query.replace(w, "")
                     clean_query = clean_query.strip(" ,.?!")
 
-                    # Se disse apenas "Jarvis" sem comando imediato
+                    # 1. Se chamou apenas o nome sem comando
                     if not clean_query:
                         resp = "Sim, senhor. Às suas ordens."
                         print(f"[RESPOSTA] {resp}")
                         speak(resp)
+                        flush_audio(stream, ring_buffer)
                         log_interaction(text, "WAKE_ONLY", resp, int((time.time() - start_time) * 1000))
                         duck_volume(low=False)
-                        ring_buffer.clear()
                         continue
 
-                    # Comandos de Música
-                    if any(m in clean_query for m in ["toca ", "toque ", "tocar ", "play "]):
-                        music_query = clean_query.replace("toca", "").replace("toque", "").replace("tocar", "").replace("play", "").strip()
-                        resp = f"Tocando {music_query} agora."
-                        speak(resp)
-                        play_music_youtube(music_query)
-                        log_interaction(text, "PLAY_MUSIC", resp, int((time.time() - start_time) * 1000))
-
-                    elif any(p in clean_query for p in ["para a música", "parar música", "para música", "silêncio", "pausa"]):
+                    # 2. Comando de PARAR MÚSICA / PAUSAR (Prioridade Máxima)
+                    stop_keywords = ["para", "parar", "pare", "silêncio", "silencio", "pausa", "pausar", "stop", "quieto", "chega", "cancela"]
+                    if any(sw in clean_query for sw in stop_keywords) and (any(m in clean_query for m in ["musica", "música", "som", "reprodução", "tocar", "video", "vídeo"]) or clean_query in stop_keywords):
+                        print("[CMD] Interrompendo áudio/música imediatamente.")
                         stop_music()
                         resp = "Música pausada."
                         speak(resp)
+                        flush_audio(stream, ring_buffer)
                         log_interaction(text, "STOP_MUSIC", resp, int((time.time() - start_time) * 1000))
+                        continue
 
-                    elif any(h in clean_query for h in ["que horas são", "hora atual", "horas agora"]):
+                    # 3. Consulta de Horas
+                    if any(h in clean_query for h in ["que horas são", "que hora é", "hora atual", "horas agora"]):
                         current_time = time.strftime("%H e %M")
                         resp = f"Agora são {current_time}."
                         speak(resp)
+                        flush_audio(stream, ring_buffer)
                         log_interaction(text, "TIME_QUERY", resp, int((time.time() - start_time) * 1000))
                         duck_volume(low=False)
+                        continue
 
-                    else:
+                    # 4. Tocar Música no YouTube
+                    play_prefixes = ["toca ", "toque ", "tocar ", "play ", "bota ", "coloque "]
+                    is_music = False
+                    music_query = ""
+                    for pt in play_prefixes:
+                        if clean_query.startswith(pt) or f" {pt}" in clean_query:
+                            idx = clean_query.find(pt) + len(pt)
+                            music_query = clean_query[idx:].strip()
+                            is_music = True
+                            break
+
+                    if is_music and music_query and len(music_query) <= 60 and "desculpe" not in music_query:
+                        resp = f"Tocando {music_query} agora."
+                        print(f"[MÚSICA] {resp}")
+                        speak(resp)
+                        flush_audio(stream, ring_buffer)
+                        play_music_youtube(music_query)
+                        log_interaction(text, "PLAY_MUSIC", resp, int((time.time() - start_time) * 1000))
+                        continue
+
+                    # 5. Raciocínio com IA (Gemini Flash)
+                    if len(clean_query) > 1 and "desculpe" not in clean_query:
                         print(f"[IA] Raciocinando com memória contextual: \"{clean_query}\"...")
                         resp = ask_jarvis_ai(clean_query)
                         print(f"[RESPOSTA] {resp}")
                         speak(resp)
+                        flush_audio(stream, ring_buffer)
                         log_interaction(text, "CHAT_AI", resp, int((time.time() - start_time) * 1000))
                         duck_volume(low=False)
+                        continue
 
-                    ring_buffer.clear()
+                    flush_audio(stream, ring_buffer)
 
             except KeyboardInterrupt:
                 print("\n[INFO] Assistente de voz finalizado.")
