@@ -6,6 +6,7 @@ import wave
 import sqlite3
 import requests
 import subprocess
+import collections
 import numpy as np
 import sounddevice as sd
 from pathlib import Path
@@ -122,27 +123,8 @@ def ask_jarvis_ai(prompt):
 
     return "Desculpe, não consegui processar a resposta no momento."
 
-def record_speech_vad(threshold, max_seconds=10, silence_timeout=0.8):
-    """Grava o áudio do microfone a partir do limiar e encerra após silêncio."""
-    frames = []
-    silent_chunks = 0
-    silence_limit = int((RATE / CHUNK) * silence_timeout)
-    max_chunks = int((RATE / CHUNK) * max_seconds)
-
-    with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK) as stream:
-        for _ in range(max_chunks):
-            data, _ = stream.read(CHUNK)
-            frames.append(data.tobytes())
-            rms = np.sqrt(np.mean(data.astype(float)**2))
-
-            if rms < threshold:
-                silent_chunks += 1
-            else:
-                silent_chunks = 0
-
-            if silent_chunks > silence_limit and len(frames) > silence_limit * 2:
-                break
-
+def create_wav_bytes(frames):
+    """Converte frames de áudio raw PCM em bytes WAV."""
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wf:
         wf.setnchannels(CHANNELS)
@@ -152,97 +134,140 @@ def record_speech_vad(threshold, max_seconds=10, silence_timeout=0.8):
     wav_io.seek(0)
     return wav_io.read()
 
-def calibrate_noise():
-    print("[CALIBRATE] Calibrando ruído ambiente do microfone...")
-    samples = []
-    try:
-        with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK) as stream:
-            for _ in range(int(RATE / CHUNK * 1.5)):
-                data, _ = stream.read(CHUNK)
-                samples.append(np.sqrt(np.mean(data.astype(float)**2)))
-        noise_floor = int(np.mean(samples)) if samples else 40
-        configured_floor = int(get_config("mic_threshold", "200") or 200)
-        threshold = max(configured_floor, int(noise_floor * 2.2))
-        print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Ativo: {threshold} RMS")
-        return threshold
-    except Exception as e:
-        print(f"[CALIBRATE WARN] {e}. Usando limiar padrão 200.")
-        return 200
-
 def main():
     print("==================================================")
-    print("🎙️ JARVIS VOICE ASSISTANT - COM MEMÓRIA ATIVA")
+    print("🎙️ JARVIS VOICE ASSISTANT - CONTÍNUO & OTIMIZADO")
     print("==================================================")
 
-    threshold = calibrate_noise()
     wake_words = [w.strip().lower() for w in get_config("wake_words", "jarvis,computador").split(",")]
-    print(f"[SYSTEM] Palavras de ativação ativas: {wake_words}")
+    print(f"[SYSTEM] Palavras de ativação: {wake_words}")
 
-    while True:
-        try:
-            with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK) as stream:
+    PRE_ROLL_SECONDS = 0.8
+    SILENCE_TIMEOUT = 1.0
+    MAX_RECORD_SECONDS = 8.0
+
+    pre_roll_chunks = int((RATE / CHUNK) * PRE_ROLL_SECONDS)
+    silence_limit = int((RATE / CHUNK) * SILENCE_TIMEOUT)
+    max_chunks = int((RATE / CHUNK) * MAX_RECORD_SECONDS)
+
+    ring_buffer = collections.deque(maxlen=pre_roll_chunks)
+
+    # Mantém o InputStream aberto continuamente (0% CPU, sem xruns)
+    with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK) as stream:
+        # Descartar primeiro 0.3s de transiente
+        for _ in range(int(RATE / CHUNK * 0.3)):
+            stream.read(CHUNK)
+
+        # Calibrar ruído de fundo (1.0 segundo)
+        print("[CALIBRATE] Calibrando ruído ambiente do microfone...")
+        calib_samples = []
+        for _ in range(int(RATE / CHUNK * 1.0)):
+            data, _ = stream.read(CHUNK)
+            calib_samples.append(np.sqrt(np.mean(data.astype(float)**2)))
+
+        noise_floor = int(np.mean(calib_samples)) if calib_samples else 20
+        configured_floor = int(get_config("mic_threshold", "120") or 120)
+        threshold = max(configured_floor, int(noise_floor * 2.2))
+        print(f"[CALIBRATE] Ruído: {noise_floor} RMS | Limiar Ativo: {threshold} RMS")
+
+        while True:
+            try:
                 data, _ = stream.read(CHUNK)
                 rms = np.sqrt(np.mean(data.astype(float)**2))
+                ring_buffer.append(data.tobytes())
 
-            if rms > threshold:
-                duck_volume(low=True)
-                start_time = time.time()
-                print(f"\n[VAD] Fala detectada ({int(rms)} RMS). Gravando comando...")
+                if rms > threshold:
+                    start_time = time.time()
+                    print(f"\n[VAD] Fala detectada ({int(rms)} RMS). Ouvindo...")
 
-                audio_data = record_speech_vad(threshold)
-                text = transcribe_audio_groq(audio_data)
+                    # Captura o áudio prévio para garantir que "Jarvis" não foi cortado
+                    recorded_frames = list(ring_buffer)
+                    silent_chunks = 0
 
-                if not text:
-                    duck_volume(low=False)
-                    continue
+                    for _ in range(max_chunks):
+                        chunk_data, _ = stream.read(CHUNK)
+                        recorded_frames.append(chunk_data.tobytes())
+                        chunk_rms = np.sqrt(np.mean(chunk_data.astype(float)**2))
 
-                text_lower = text.lower()
-                print(f"[OUVIU] \"{text}\"")
+                        if chunk_rms < threshold:
+                            silent_chunks += 1
+                        else:
+                            silent_chunks = 0
 
-                is_wake = any(w in text_lower for w in wake_words)
-                if not is_wake:
-                    duck_volume(low=False)
-                    continue
+                        if silent_chunks > silence_limit and len(recorded_frames) > silence_limit * 2:
+                            break
 
-                clean_query = text_lower
-                for w in wake_words:
-                    clean_query = clean_query.replace(w, "")
-                clean_query = clean_query.strip(",.?! ")
+                    # Ignora barulhinhos/cliques ultracurtos (< 0.4s)
+                    if len(recorded_frames) < int((RATE / CHUNK) * 0.4):
+                        continue
 
-                if any(m in clean_query for m in ["toca ", "toque ", "tocar ", "play "]):
-                    music_query = clean_query.replace("toca", "").replace("toque", "").replace("tocar", "").replace("play", "").strip()
-                    resp = f"Tocando {music_query} agora."
-                    speak(resp)
-                    play_music_youtube(music_query)
-                    log_interaction(text, "PLAY_MUSIC", resp, int((time.time() - start_time) * 1000))
+                    audio_bytes = create_wav_bytes(recorded_frames)
+                    text = transcribe_audio_groq(audio_bytes)
 
-                elif any(p in clean_query for p in ["para a música", "parar música", "para música", "silêncio", "pausa"]):
-                    stop_music()
-                    resp = "Música pausada."
-                    speak(resp)
-                    log_interaction(text, "STOP_MUSIC", resp, int((time.time() - start_time) * 1000))
+                    if not text:
+                        continue
 
-                elif any(h in clean_query for h in ["que horas são", "hora atual", "horas agora"]):
-                    current_time = time.strftime("%H e %M")
-                    resp = f"Agora são {current_time}."
-                    speak(resp)
-                    log_interaction(text, "TIME_QUERY", resp, int((time.time() - start_time) * 1000))
-                    duck_volume(low=False)
+                    text_lower = text.lower()
+                    print(f"[OUVIU] \"{text}\"")
 
-                else:
-                    print(f"[IA] Raciocinando com memória contextual: \"{clean_query}\"...")
-                    resp = ask_jarvis_ai(clean_query)
-                    print(f"[RESPOSTA] {resp}")
-                    speak(resp)
-                    log_interaction(text, "CHAT_AI", resp, int((time.time() - start_time) * 1000))
-                    duck_volume(low=False)
+                    is_wake = any(w in text_lower for w in wake_words)
+                    if not is_wake:
+                        continue
 
-        except KeyboardInterrupt:
-            print("\n[INFO] Assistente de voz finalizado.")
-            break
-        except Exception as e:
-            print(f"[VOICE ERROR] {e}")
-            time.sleep(1)
+                    duck_volume(low=True)
+
+                    clean_query = text_lower
+                    for w in wake_words:
+                        clean_query = clean_query.replace(w, "")
+                    clean_query = clean_query.strip(",.?! ")
+
+                    # Se disse apenas "Jarvis" sem comando imediato
+                    if not clean_query:
+                        resp = "Sim, senhor. Como posso ajudar?"
+                        print(f"[RESPOSTA] {resp}")
+                        speak(resp)
+                        log_interaction(text, "WAKE_ONLY", resp, int((time.time() - start_time) * 1000))
+                        duck_volume(low=False)
+                        ring_buffer.clear()
+                        continue
+
+                    # Comandos de Música
+                    if any(m in clean_query for m in ["toca ", "toque ", "tocar ", "play "]):
+                        music_query = clean_query.replace("toca", "").replace("toque", "").replace("tocar", "").replace("play", "").strip()
+                        resp = f"Tocando {music_query} agora."
+                        speak(resp)
+                        play_music_youtube(music_query)
+                        log_interaction(text, "PLAY_MUSIC", resp, int((time.time() - start_time) * 1000))
+
+                    elif any(p in clean_query for p in ["para a música", "parar música", "para música", "silêncio", "pausa"]):
+                        stop_music()
+                        resp = "Música pausada."
+                        speak(resp)
+                        log_interaction(text, "STOP_MUSIC", resp, int((time.time() - start_time) * 1000))
+
+                    elif any(h in clean_query for h in ["que horas são", "hora atual", "horas agora"]):
+                        current_time = time.strftime("%H e %M")
+                        resp = f"Agora são {current_time}."
+                        speak(resp)
+                        log_interaction(text, "TIME_QUERY", resp, int((time.time() - start_time) * 1000))
+                        duck_volume(low=False)
+
+                    else:
+                        print(f"[IA] Raciocinando com memória contextual: \"{clean_query}\"...")
+                        resp = ask_jarvis_ai(clean_query)
+                        print(f"[RESPOSTA] {resp}")
+                        speak(resp)
+                        log_interaction(text, "CHAT_AI", resp, int((time.time() - start_time) * 1000))
+                        duck_volume(low=False)
+
+                    ring_buffer.clear()
+
+            except KeyboardInterrupt:
+                print("\n[INFO] Assistente de voz finalizado.")
+                break
+            except Exception as e:
+                print(f"[VOICE ERROR] {e}")
+                time.sleep(0.5)
 
 if __name__ == "__main__":
     main()
